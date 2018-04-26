@@ -63,4 +63,40 @@ C_OBJECT($o)
 $o:=JSON Parse($json)
 ```
 
+### The returned object
+
+``UUID``: ``string`` the identifier used as folder name inside each ``mbox``  
+``messages``: ``array`` of messages
+
+### The message object
+
+``attachments``: ``array`` of attachments  
+``color``: ``number``  
+``date_created``: ``number``  
+``date_received``: ``number``  
+``date_sent``: ``number``  
+``flagged``: ``number``  
+``flags``: ``number``  
+``ID``: ``number``  
+``mailbox``: ``string`` a URL style identifier of the local mailbox  
+``recipients``: ``array`` of recipients  
+``sender``: ``object``  
+``sender.ID``: ``number``  
+``sender.address``: ``string``  
+``sender.name``: ``string`` display name  
+``size``: ``number``  
+``snippet``: ``string``  
+``subject``: ``string``  
+``type``: ``number``  
+
+### The attachment object
+
+``ID``: ``number``  
+``name``: ``string`` file name  
+
+### The recipient object
+
+``ID``: ``number``  
+``address``: ``string``  
+``name``: ``string`` display name  
 
