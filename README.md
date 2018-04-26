@@ -43,3 +43,24 @@ attachments              labels                   recipients
 duplicates_unread_count  mailboxes                subjects               
 events                   messages                 threads   
 ```
+
+This plugins attempts to fetch some meta information from this database by calling SQLite3 directly.
+
+###Examples
+
+```
+ARRAY LONGINT($values;3)
+
+$values{1}:=1238253
+$values{2}:=1238259
+$values{3}:=1238271
+
+$json:=Mail Get message properties ($values)
+
+SET TEXT TO PASTEBOARD($json)
+
+C_OBJECT($o)
+$o:=JSON Parse($json)
+```
+
+
