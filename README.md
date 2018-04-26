@@ -1,7 +1,7 @@
 # 4d-plugin-mail-sqlite
 Get meta information of emails managed by Apple Mail using SQLite3
 
-**experimental**
+***experimental***
 
 ### Platform
 
@@ -46,7 +46,7 @@ events                   messages                 threads
 
 This plugins attempts to fetch some meta information from this database by calling SQLite3 directly.
 
-###Examples
+### Examples
 
 ```
 ARRAY LONGINT($values;3)
