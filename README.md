@@ -24,3 +24,22 @@ Parameter|Type|Description
 messages|ARRAY LONGINT|message ``id`` as seen in applescript
 properties|TEXT|``JSON`` array of objects
 
+### Discussion
+
+It is well known that Apple Mail uses SQLite3 internally.
+
+```bash
+sqlite3 ~/Library/Mail/V5/MailData/Envelope\ Index
+```
+
+**Note**: The exact path depends on the macOS version.
+
+There are 12 tables.
+
+```bash
+.tables
+addresses                ews_folders              properties             
+attachments              labels                   recipients             
+duplicates_unread_count  mailboxes                subjects               
+events                   messages                 threads   
+```
