@@ -119,15 +119,15 @@ NSString *get_sqlite3_path_for_mail_for_current_version()
 	return path;
 }
 
-const char *get_sqlite3_path_for_mail()
+NSString *get_sqlite3_path_for_mail()
 {
 	NSURL *library_url = get_library_url();
 	
 	if(!library_url)
-		return 0;
+		return nil;
 
-	return [[[[library_url URLByAppendingPathComponent:@"Mail"] path]
-					 stringByAppendingString:get_sqlite3_path_for_mail_for_current_version()] UTF8String];
+	return [[[library_url URLByAppendingPathComponent:@"Mail"] path]
+					stringByAppendingString:get_sqlite3_path_for_mail_for_current_version()];
 }
 
 #pragma mark SQL
@@ -142,46 +142,69 @@ namespace SQL
 
 #include "sqlite3.h"
 
-void Mail_Get_message_properties(sLONG_PTR *pResult, PackagePtr pParams)
+//finalize/close on every exit path, including exceptions
+//(sqlite3_close fails with SQLITE_BUSY and leaves the connection open
+//while any statement is still unfinalized)
+struct sqlite3_db_guard
 {
-	ARRAY_LONGINT Param1;
-	C_TEXT returnValue;
+	sqlite3 *db = NULL;
+	~sqlite3_db_guard() { if(db) sqlite3_close(db); }
+};
 
-	NSMutableDictionary *json = [[NSMutableDictionary alloc]init];
+struct sqlite3_stmt_guard
+{
+	sqlite3_stmt *stmt = NULL;
+	~sqlite3_stmt_guard() { if(stmt) sqlite3_finalize(stmt); }
+};
+
+//Mail keeps the database open; wait briefly for a lock instead of
+//returning partial results, but never block the 4D process for long
+#define MAIL_SQLITE_BUSY_TIMEOUT_MS 1000
+
+static void Mail_Get_message_properties_json(ARRAY_LONGINT &Param1, NSMutableDictionary *json)
+{
+	NSString *path = get_sqlite3_path_for_mail();
 	
-	const char *path = get_sqlite3_path_for_mail();
+	if(!path)
+		return;
 	
-	if(path)
+	sqlite3_db_guard ds;
+	
+	//no SQLITE_OPEN_CREATE: a missing file (wrong path) is an error, not a new empty database.
+	//not SQLITE_OPEN_READONLY: the database is in WAL mode, and a read-only connection
+	//cannot read it while Mail is not running (no -shm file); query_only blocks writes instead
+	int err = sqlite3_open_v2([path fileSystemRepresentation], &ds.db, SQLITE_OPEN_READWRITE, NULL);
+	
+	if(SQLITE_OK != err)
+		return; //ds.db (if any) is closed by the guard
+	
+	sqlite3_exec(ds.db, "PRAGMA query_only = 1;", NULL, NULL, NULL);
+	sqlite3_busy_timeout(ds.db, MAIL_SQLITE_BUSY_TIMEOUT_MS);
+	
 	{
-		sqlite3 *ds = NULL;
+		const char *csv0 = "select value from properties where key == 'UUID' limit 1;";
+		sqlite3_stmt_guard sql0;
 		
-		if(SQLITE_OK == sqlite3_open(path, &ds))
+		if(SQLITE_OK == sqlite3_prepare_v2(ds.db, csv0, -1, &sql0.stmt, NULL))
 		{
-			Param1.fromParamAtIndex(pParams, 1);
-			NSUInteger capacity = Param1.getSize();
-			NSMutableArray *values = [[NSMutableArray alloc]initWithCapacity:capacity];
-
-			@autoreleasepool
+			if(SQLITE_ROW == sqlite3_step(sql0.stmt))
 			{
-				
-				const char *csv0 = "select value from properties where key == 'UUID' limit 1;";
-				sqlite3_stmt *sql0 = NULL;
-				
-				if(SQLITE_OK == sqlite3_prepare_v2(ds, csv0, strlen(csv0), &sql0, NULL))
-				{
-					if(SQLITE_ROW == sqlite3_step(sql0))
-					{
-						[json setObject:json_string_value(sqlite3_column_text(sql0, 0)) forKey:@"UUID"];
-					}
-				}
-				
-				for(unsigned int i = 1;i < capacity;++i)
-				{
-					[values addObject:[NSNumber numberWithInteger:Param1.getIntValueAtIndex(i)]];
-				}
-				
-				const char *csv1 = [[NSString stringWithFormat:
-														@"select \n\
+				[json setObject:json_string_value(sqlite3_column_text(sql0.stmt, 0)) forKey:@"UUID"];
+			}
+		}
+	}
+	
+	//element 0 is not used; only integers go into the IN list
+	NSUInteger capacity = Param1.getSize();
+	NSMutableArray *values = [NSMutableArray arrayWithCapacity:capacity];
+	
+	for(NSUInteger i = 1;i < capacity;++i)
+	{
+		[values addObject:[NSNumber numberWithInt:Param1.getIntValueAtIndex((uint32_t)i)]];
+	}
+	
+	const char *csv1 = [[NSString stringWithFormat:
+											@"select \n\
 messages.ROWID, \n\
 mailboxes.url, \n\
 addresses.address, \n\
@@ -205,121 +228,143 @@ and addresses.ROWID == messages.sender \n\
 and subjects.ROWID == messages.subject \n\
 and mailboxes.ROWID == messages.mailbox \n\
 ;",
-														[values componentsJoinedByString:@","]] UTF8String];
-			
-				/* messages: ROWID|message_id|document_id|in_reply_to|remote_id|sender|subject_prefix|subject|date_sent|date_received|date_created|date_last_viewed|mailbox|remote_mailbox|flags|read|flagged|size|color|type|conversation_id|snippet|fuzzy_ancestor|automated_conversation|root_status|conversation_position|deleted */
-				sqlite3_stmt *sql1 = NULL;
-				
-				if(SQLITE_OK == sqlite3_prepare_v2(ds, csv1, strlen(csv1), &sql1, NULL))
-				{
-					NSMutableArray *json_messages = [NSMutableArray array];
-					
-					while(SQLITE_ROW == sqlite3_step(sql1))
-					{
-						
-						int m = sqlite3_column_int(sql1, 0);
-						
-						NSMutableDictionary *json_message = [NSMutableDictionary dictionary];
-						[json_message setObject:@(m) forKey:@"ID"];
-						[json_message setObject:json_string_value(sqlite3_column_text(sql1, 1)) forKey:@"mailbox"];
-						[json_message setObject:json_string_value(sqlite3_column_text(sql1, 4)) forKey:@"subject"];
-						[json_message setObject:json_string_value(sqlite3_column_text(sql1, 5)) forKey:@"snippet"];
-
-						[json_message setObject:@(sqlite3_column_int(sql1, 7)) forKey:@"size"];
-						[json_message setObject:@(sqlite3_column_int(sql1, 8)) forKey:@"color"];
-						[json_message setObject:@(sqlite3_column_int(sql1, 9)) forKey:@"type"];
-						[json_message setObject:@(sqlite3_column_int(sql1, 10)) forKey:@"flagged"];
-
-						[json_message setObject:@(sqlite3_column_int(sql1, 11)) forKey:@"flags"];
-						[json_message setObject:@(sqlite3_column_int(sql1, 12)) forKey:@"date_sent"];
-						[json_message setObject:@(sqlite3_column_int(sql1, 13)) forKey:@"date_received"];
-						[json_message setObject:@(sqlite3_column_int(sql1, 14)) forKey:@"date_created"];
-						
-						[json_message setObject:@{
-							@"ID":@(sqlite3_column_int(sql1, 6)),
-							@"address":json_string_value(sqlite3_column_text(sql1, 2)),
-							@"name":json_string_value(sqlite3_column_text(sql1, 3))
-						} forKey:@"sender"];
-						
-						const char *csv2 = [[NSString stringWithFormat:
-																 @"select \n\
+											[values componentsJoinedByString:@","]] UTF8String];
+	
+	/* messages: ROWID|message_id|document_id|in_reply_to|remote_id|sender|subject_prefix|subject|date_sent|date_received|date_created|date_last_viewed|mailbox|remote_mailbox|flags|read|flagged|size|color|type|conversation_id|snippet|fuzzy_ancestor|automated_conversation|root_status|conversation_position|deleted */
+	sqlite3_stmt_guard sql1;
+	
+	if(SQLITE_OK != sqlite3_prepare_v2(ds.db, csv1, -1, &sql1.stmt, NULL))
+		return;
+	
+	/* attachments: ROWID|message_id|name */
+	const char *csv2 = "select \n\
 attachments.ROWID, \n\
 attachments.name \n\
 from \n\
-messages,attachments \n\
+attachments \n\
 where \n\
-messages.ROWID == %d \n\
-and \n\
-attachments.message_id == messages.ROWID \n\
-;",
-m] UTF8String];
-
-						/* attachments: ROWID|message_id|name */
-						sqlite3_stmt *sql2 = NULL;
-						if(SQLITE_OK == sqlite3_prepare_v2(ds, csv2, strlen(csv2), &sql2, NULL))
-						{
-							NSMutableArray *json_attachments = [NSMutableArray array];
-							while(SQLITE_ROW == sqlite3_step(sql2))
-							{
-								[json_attachments addObject:@{
-									@"ID":@(sqlite3_column_int(sql2, 0)),
-									@"name":json_string_value(sqlite3_column_text(sql2, 1))
-								}];
-							}
-							[json_message setObject:json_attachments forKey:@"attachments"];
-						}
-						
-						const char *csv3 = [[NSString stringWithFormat:
-																 @"select \n\
+attachments.message_id == ?1 \n\
+;";
+	
+	/* recipients: ROWID|message_id|type|address_id|position */
+	const char *csv3 = "select \n\
 recipients.ROWID, \n\
 recipients.type, \n\
 recipients.position, \n\
 addresses.address, \n\
 addresses.comment \n\
 from \n\
-recipients,addresses,messages \n\
+recipients,addresses \n\
 where \n\
-messages.ROWID == %d \n\
-and \n\
-recipients.message_id == messages.ROWID \n\
+recipients.message_id == ?1 \n\
 and \n\
 addresses.ROWID == recipients.address_id \n\
-;",
-m] UTF8String];
-						
-						/* recipients: ROWID|message_id|type|address_id|position */
-						sqlite3_stmt *sql3 = NULL;
-						if(SQLITE_OK == sqlite3_prepare_v2(ds, csv3, strlen(csv3), &sql3, NULL))
-						{
-							NSMutableArray *json_recipients = [NSMutableArray array];
-							while(SQLITE_ROW == sqlite3_step(sql3))
-							{
-								[json_recipients addObject:@{
-									@"ID":@(sqlite3_column_int(sql3, 0)),
-//									@"type":@(sqlite3_column_int(sql3, 1)),
-//									@"position":@(sqlite3_column_int(sql3, 2)),
-									@"address":json_string_value(sqlite3_column_text(sql3, 3)),
-									@"name":json_string_value(sqlite3_column_text(sql3, 4))
-								}];
-							}
-							[json_message setObject:json_recipients forKey:@"recipients"];
-						}
-						
-						[json_messages addObject:json_message];
-					}
-					
-					[json setObject:json_messages forKey:@"messages"];
-				}
-				sqlite3_close(ds);
-			}/* @autoreleasepool */
+;";
 	
-		}
-		
+	//prepared once, rebound for each message
+	sqlite3_stmt_guard sql2;
+	sqlite3_stmt_guard sql3;
+	if(SQLITE_OK != sqlite3_prepare_v2(ds.db, csv2, -1, &sql2.stmt, NULL))
+		sql2.stmt = NULL;
+	if(SQLITE_OK != sqlite3_prepare_v2(ds.db, csv3, -1, &sql3.stmt, NULL))
+		sql3.stmt = NULL;
+	
+	NSMutableArray *json_messages = [NSMutableArray array];
+	
+	while(SQLITE_ROW == sqlite3_step(sql1.stmt))
+	{
+		@autoreleasepool
+		{
+			sqlite3_int64 m = sqlite3_column_int64(sql1.stmt, 0);
+			
+			NSMutableDictionary *json_message = [NSMutableDictionary dictionary];
+			[json_message setObject:@(m) forKey:@"ID"];
+			[json_message setObject:json_string_value(sqlite3_column_text(sql1.stmt, 1)) forKey:@"mailbox"];
+			[json_message setObject:json_string_value(sqlite3_column_text(sql1.stmt, 4)) forKey:@"subject"];
+			[json_message setObject:json_string_value(sqlite3_column_text(sql1.stmt, 5)) forKey:@"snippet"];
+			
+			[json_message setObject:@(sqlite3_column_int64(sql1.stmt, 7)) forKey:@"size"];
+			[json_message setObject:@(sqlite3_column_int64(sql1.stmt, 8)) forKey:@"color"];
+			[json_message setObject:@(sqlite3_column_int64(sql1.stmt, 9)) forKey:@"type"];
+			[json_message setObject:@(sqlite3_column_int64(sql1.stmt, 10)) forKey:@"flagged"];
+			
+			[json_message setObject:@(sqlite3_column_int64(sql1.stmt, 11)) forKey:@"flags"];
+			[json_message setObject:@(sqlite3_column_int64(sql1.stmt, 12)) forKey:@"date_sent"];
+			[json_message setObject:@(sqlite3_column_int64(sql1.stmt, 13)) forKey:@"date_received"];
+			[json_message setObject:@(sqlite3_column_int64(sql1.stmt, 14)) forKey:@"date_created"];
+			
+			[json_message setObject:@{
+				@"ID":@(sqlite3_column_int64(sql1.stmt, 6)),
+				@"address":json_string_value(sqlite3_column_text(sql1.stmt, 2)),
+				@"name":json_string_value(sqlite3_column_text(sql1.stmt, 3))
+			} forKey:@"sender"];
+			
+			if(sql2.stmt)
+			{
+				sqlite3_reset(sql2.stmt);
+				sqlite3_bind_int64(sql2.stmt, 1, m);
+				
+				NSMutableArray *json_attachments = [NSMutableArray array];
+				while(SQLITE_ROW == sqlite3_step(sql2.stmt))
+				{
+					[json_attachments addObject:@{
+						@"ID":@(sqlite3_column_int64(sql2.stmt, 0)),
+						@"name":json_string_value(sqlite3_column_text(sql2.stmt, 1))
+					}];
+				}
+				[json_message setObject:json_attachments forKey:@"attachments"];
+			}
+			
+			if(sql3.stmt)
+			{
+				sqlite3_reset(sql3.stmt);
+				sqlite3_bind_int64(sql3.stmt, 1, m);
+				
+				NSMutableArray *json_recipients = [NSMutableArray array];
+				while(SQLITE_ROW == sqlite3_step(sql3.stmt))
+				{
+					[json_recipients addObject:@{
+						@"ID":@(sqlite3_column_int64(sql3.stmt, 0)),
+//						@"type":@(sqlite3_column_int64(sql3.stmt, 1)),
+//						@"position":@(sqlite3_column_int64(sql3.stmt, 2)),
+						@"address":json_string_value(sqlite3_column_text(sql3.stmt, 3)),
+						@"name":json_string_value(sqlite3_column_text(sql3.stmt, 4))
+					}];
+				}
+				[json_message setObject:json_recipients forKey:@"recipients"];
+			}
+			
+			[json_messages addObject:json_message];
+			
+		}/* @autoreleasepool */
 	}
 	
-	json_stringify(json, returnValue);
-	[json release];
+	[json setObject:json_messages forKey:@"messages"];
+}
+
+void Mail_Get_message_properties(sLONG_PTR *pResult, PackagePtr pParams)
+{
+	ARRAY_LONGINT Param1;
+	C_TEXT returnValue;
+	
+	@autoreleasepool
+	{
+		NSMutableDictionary *json = [NSMutableDictionary dictionary];
+		
+		//an exception must not escape before the return value is set
+		try
+		{
+			Param1.fromParamAtIndex(pParams, 1);
+			Mail_Get_message_properties_json(Param1, json);
+		}
+		catch(...)
+		{
+			
+		}
+		
+		json_stringify(json, returnValue);
+		
+	}/* @autoreleasepool */
 	
 	returnValue.setReturn(pResult);
 }
-
