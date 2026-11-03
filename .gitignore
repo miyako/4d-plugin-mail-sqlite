@@ -1,0 +1,6 @@
+.DS_Store
+build/
+*.4dbase/Logs/
+*.4dbase/userPreferences.*/
+Mail (SQLite).4dbase/Plugins/Mail (SQLite).bundle/Contents/MacOS/
+Mail (SQLite).4dbase/Plugins/Mail (SQLite).bundle/Contents/_CodeSignature/
