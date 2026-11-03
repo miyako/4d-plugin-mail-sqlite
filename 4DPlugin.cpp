@@ -74,60 +74,53 @@ NSURL *get_library_url()
 	return (URLs && [URLs count]) ? [URLs objectAtIndex:0] : nil;
 }
 
-#include <errno.h>
-#include <sys/sysctl.h>
-
-NSString *get_sqlite3_path_for_mail_for_current_version()
-{
-	NSString *path = @"/V6/MailData/Envelope Index";
-	
-	char str[64];
-	size_t size = sizeof(str);
-	
-	if(!sysctlbyname("kern.osrelease", str, &size, NULL, 0))
-	{
-		@autoreleasepool
-		{
-			NSString *version = [NSString stringWithFormat:@"%s", str];
-			
-			if([version hasPrefix:@"17."])
-			{
-				path = @"/V5/MailData/Envelope Index";
-			}else if([version hasPrefix:@"16."])
-			{
-				path = @"/V4/MailData/Envelope Index";
-			}else if([version hasPrefix:@"15."])
-			{
-				path = @"/V3/MailData/Envelope Index";
-			}
-			else if( ([version hasPrefix:@"14."])
-							|([version hasPrefix:@"13."])
-							|([version hasPrefix:@"12."])
-							|([version hasPrefix:@"11."]))
-			{
-				path = @"/V2/MailData/Envelope Index";
-			}
-			else
-			{
-				path = @"/Envelope Index";
-			}
-			
-		}/* @autoreleasepool */
-		
-	}
-	
-	return path;
-}
-
+//Mail keeps its data in a versioned folder (V2 ... V10 so far) whose number
+//changes with macOS releases, and an upgraded Mac can keep the folders of
+//earlier versions; use the highest-numbered one that holds an Envelope Index
 NSString *get_sqlite3_path_for_mail()
 {
 	NSURL *library_url = get_library_url();
 	
 	if(!library_url)
 		return nil;
-
-	return [[[library_url URLByAppendingPathComponent:@"Mail"] path]
-					stringByAppendingString:get_sqlite3_path_for_mail_for_current_version()];
+	
+	NSString *mail_path = [[library_url URLByAppendingPathComponent:@"Mail"] path];
+	NSFileManager *fm = [NSFileManager defaultManager];
+	NSCharacterSet *non_digits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+	
+	//nil without Full Disk Access; the fallback path then fails to open
+	NSArray *names = [fm contentsOfDirectoryAtPath:mail_path error:nil];
+	
+	NSString *best_path = nil;
+	NSInteger best_version = 0;
+	
+	for(NSString *name in names)
+	{
+		if(([name length] < 2) || (![name hasPrefix:@"V"]))
+			continue;
+		
+		NSString *digits = [name substringFromIndex:1];
+		
+		if([digits rangeOfCharacterFromSet:non_digits].location != NSNotFound)
+			continue;
+		
+		NSInteger version = [digits integerValue];
+		
+		if(version <= best_version)
+			continue;
+		
+		NSString *path = [[mail_path stringByAppendingPathComponent:name]
+											stringByAppendingPathComponent:@"MailData/Envelope Index"];
+		
+		if([fm fileExistsAtPath:path])
+		{
+			best_path = path;
+			best_version = version;
+		}
+	}
+	
+	//Mail before OS X 10.7 kept the database directly in ~/Library/Mail
+	return best_path ? best_path : [mail_path stringByAppendingPathComponent:@"Envelope Index"];
 }
 
 #pragma mark SQL
@@ -161,6 +154,49 @@ struct sqlite3_stmt_guard
 //returning partial results, but never block the 4D process for long
 #define MAIL_SQLITE_BUSY_TIMEOUT_MS 1000
 
+//the Envelope Index schema is undocumented and changes between Mail versions
+//(e.g. recipients.message_id became recipients.message, messages.snippet was
+//replaced by messages.summary -> summaries); check before using a column
+static bool sqlite3_has_table(sqlite3 *db, const char *table)
+{
+	sqlite3_stmt_guard s;
+	
+	if(SQLITE_OK != sqlite3_prepare_v2(db, "select 1 from sqlite_master where type == 'table' and name == ?1;", -1, &s.stmt, NULL))
+		return false;
+	
+	sqlite3_bind_text(s.stmt, 1, table, -1, SQLITE_STATIC);
+	
+	return SQLITE_ROW == sqlite3_step(s.stmt);
+}
+
+static bool sqlite3_has_column(sqlite3 *db, const char *table, const char *column)
+{
+	//table is always a constant from this file, never user input
+	std::string sql = std::string("PRAGMA table_info(") + table + ");";
+	
+	sqlite3_stmt_guard s;
+	
+	if(SQLITE_OK != sqlite3_prepare_v2(db, sql.c_str(), -1, &s.stmt, NULL))
+		return false;
+	
+	while(SQLITE_ROW == sqlite3_step(s.stmt))
+	{
+		const unsigned char *name = sqlite3_column_text(s.stmt, 1);
+		
+		if(name && (!strcmp((const char *)name, column)))
+			return true;
+	}
+	
+	return false;
+}
+
+typedef struct
+{
+	const char *column;
+	NSString *key;
+	bool present;
+} mail_message_column;
+
 static void Mail_Get_message_properties_json(ARRAY_LONGINT &Param1, NSMutableDictionary *json)
 {
 	NSString *path = get_sqlite3_path_for_mail();
@@ -181,6 +217,7 @@ static void Mail_Get_message_properties_json(ARRAY_LONGINT &Param1, NSMutableDic
 	sqlite3_exec(ds.db, "PRAGMA query_only = 1;", NULL, NULL, NULL);
 	sqlite3_busy_timeout(ds.db, MAIL_SQLITE_BUSY_TIMEOUT_MS);
 	
+	if(sqlite3_has_table(ds.db, "properties"))
 	{
 		const char *csv0 = "select value from properties where key == 'UUID' limit 1;";
 		sqlite3_stmt_guard sql0;
@@ -194,6 +231,9 @@ static void Mail_Get_message_properties_json(ARRAY_LONGINT &Param1, NSMutableDic
 		}
 	}
 	
+	if(!sqlite3_has_table(ds.db, "messages"))
+		return;
+	
 	//element 0 is not used; only integers go into the IN list
 	NSUInteger capacity = Param1.getSize();
 	NSMutableArray *values = [NSMutableArray arrayWithCapacity:capacity];
@@ -203,6 +243,50 @@ static void Mail_Get_message_properties_json(ARRAY_LONGINT &Param1, NSMutableDic
 		[values addObject:[NSNumber numberWithInt:Param1.getIntValueAtIndex((uint32_t)i)]];
 	}
 	
+	/* V6 messages: ROWID|message_id|document_id|in_reply_to|remote_id|sender|subject_prefix|subject|date_sent|date_received|date_created|date_last_viewed|mailbox|remote_mailbox|flags|read|flagged|size|color|type|conversation_id|snippet|fuzzy_ancestor|automated_conversation|root_status|conversation_position|deleted */
+	
+	//integer properties, returned only when the column exists in this Mail version
+	mail_message_column columns[] = {
+		{"size", @"size", false},
+		{"color", @"color", false},
+		{"type", @"type", false},
+		{"flagged", @"flagged", false},
+		{"flags", @"flags", false},
+		{"date_sent", @"date_sent", false},
+		{"date_received", @"date_received", false},
+		{"date_created", @"date_created", false}
+	};
+	const int first_column = 7; //index of columns[0] in the select list
+	const size_t column_count = sizeof(columns) / sizeof(columns[0]);
+	
+	NSMutableString *select_list = [NSMutableString string];
+	
+	for(size_t i = 0; i < column_count; ++i)
+	{
+		columns[i].present = sqlite3_has_column(ds.db, "messages", columns[i].column);
+		[select_list appendFormat:@", \n%@", columns[i].present
+		 ? [NSString stringWithFormat:@"messages.%s", columns[i].column]
+		 : @"NULL"];
+	}
+	
+	//V6 and earlier: messages.snippet; later: messages.summary -> summaries.summary
+	NSString *snippet = @"NULL";
+	bool has_snippet = true;
+	
+	if(sqlite3_has_column(ds.db, "messages", "snippet"))
+	{
+		snippet = @"messages.snippet";
+	}
+	else if(sqlite3_has_column(ds.db, "messages", "summary") && sqlite3_has_table(ds.db, "summaries"))
+	{
+		snippet = @"(select summaries.summary from summaries where summaries.ROWID == messages.summary)";
+	}
+	else
+	{
+		has_snippet = false;
+	}
+	
+	//left joins: a message whose sender, subject or mailbox row is missing is still returned
 	const char *csv1 = [[NSString stringWithFormat:
 											@"select \n\
 messages.ROWID, \n\
@@ -210,44 +294,45 @@ mailboxes.url, \n\
 addresses.address, \n\
 addresses.comment, \n\
 subjects.subject, \n\
-messages.snippet, \n\
-messages.sender, \n\
-messages.size, \n\
-messages.color, \n\
-messages.type, \n\
-messages.flagged, \n\
-messages.flags, \n\
-messages.date_sent, \n\
-messages.date_received, \n\
-messages.date_created \n\
+%@, \n\
+messages.sender%@ \n\
 from \n\
-addresses,messages,subjects,mailboxes \n\
+messages \n\
+left join addresses on addresses.ROWID == messages.sender \n\
+left join subjects on subjects.ROWID == messages.subject \n\
+left join mailboxes on mailboxes.ROWID == messages.mailbox \n\
 where \n\
 messages.ROWID IN (%@) \n\
-and addresses.ROWID == messages.sender \n\
-and subjects.ROWID == messages.subject \n\
-and mailboxes.ROWID == messages.mailbox \n\
 ;",
+											snippet,
+											select_list,
 											[values componentsJoinedByString:@","]] UTF8String];
 	
-	/* messages: ROWID|message_id|document_id|in_reply_to|remote_id|sender|subject_prefix|subject|date_sent|date_received|date_created|date_last_viewed|mailbox|remote_mailbox|flags|read|flagged|size|color|type|conversation_id|snippet|fuzzy_ancestor|automated_conversation|root_status|conversation_position|deleted */
 	sqlite3_stmt_guard sql1;
 	
 	if(SQLITE_OK != sqlite3_prepare_v2(ds.db, csv1, -1, &sql1.stmt, NULL))
 		return;
 	
-	/* attachments: ROWID|message_id|name */
-	const char *csv2 = "select \n\
+	//V6 and earlier: message_id, address_id; later: message, address
+	const char *attachments_message = sqlite3_has_column(ds.db, "attachments", "message_id") ? "message_id" : "message";
+	const char *recipients_message = sqlite3_has_column(ds.db, "recipients", "message_id") ? "message_id" : "message";
+	const char *recipients_address = sqlite3_has_column(ds.db, "recipients", "address_id") ? "address_id" : "address";
+	
+	/* V6 attachments: ROWID|message_id|name */
+	const char *csv2 = [[NSString stringWithFormat:
+											@"select \n\
 attachments.ROWID, \n\
 attachments.name \n\
 from \n\
 attachments \n\
 where \n\
-attachments.message_id == ?1 \n\
-;";
+attachments.%s == ?1 \n\
+;",
+											attachments_message] UTF8String];
 	
-	/* recipients: ROWID|message_id|type|address_id|position */
-	const char *csv3 = "select \n\
+	/* V6 recipients: ROWID|message_id|type|address_id|position */
+	const char *csv3 = [[NSString stringWithFormat:
+											@"select \n\
 recipients.ROWID, \n\
 recipients.type, \n\
 recipients.position, \n\
@@ -256,10 +341,11 @@ addresses.comment \n\
 from \n\
 recipients,addresses \n\
 where \n\
-recipients.message_id == ?1 \n\
+recipients.%s == ?1 \n\
 and \n\
-addresses.ROWID == recipients.address_id \n\
-;";
+addresses.ROWID == recipients.%s \n\
+;",
+											recipients_message, recipients_address] UTF8String];
 	
 	//prepared once, rebound for each message
 	sqlite3_stmt_guard sql2;
@@ -281,17 +367,19 @@ addresses.ROWID == recipients.address_id \n\
 			[json_message setObject:@(m) forKey:@"ID"];
 			[json_message setObject:json_string_value(sqlite3_column_text(sql1.stmt, 1)) forKey:@"mailbox"];
 			[json_message setObject:json_string_value(sqlite3_column_text(sql1.stmt, 4)) forKey:@"subject"];
-			[json_message setObject:json_string_value(sqlite3_column_text(sql1.stmt, 5)) forKey:@"snippet"];
 			
-			[json_message setObject:@(sqlite3_column_int64(sql1.stmt, 7)) forKey:@"size"];
-			[json_message setObject:@(sqlite3_column_int64(sql1.stmt, 8)) forKey:@"color"];
-			[json_message setObject:@(sqlite3_column_int64(sql1.stmt, 9)) forKey:@"type"];
-			[json_message setObject:@(sqlite3_column_int64(sql1.stmt, 10)) forKey:@"flagged"];
+			if(has_snippet)
+			{
+				[json_message setObject:json_string_value(sqlite3_column_text(sql1.stmt, 5)) forKey:@"snippet"];
+			}
 			
-			[json_message setObject:@(sqlite3_column_int64(sql1.stmt, 11)) forKey:@"flags"];
-			[json_message setObject:@(sqlite3_column_int64(sql1.stmt, 12)) forKey:@"date_sent"];
-			[json_message setObject:@(sqlite3_column_int64(sql1.stmt, 13)) forKey:@"date_received"];
-			[json_message setObject:@(sqlite3_column_int64(sql1.stmt, 14)) forKey:@"date_created"];
+			for(size_t i = 0; i < column_count; ++i)
+			{
+				if(columns[i].present)
+				{
+					[json_message setObject:@(sqlite3_column_int64(sql1.stmt, first_column + (int)i)) forKey:columns[i].key];
+				}
+			}
 			
 			[json_message setObject:@{
 				@"ID":@(sqlite3_column_int64(sql1.stmt, 6)),

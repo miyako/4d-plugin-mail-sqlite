@@ -20,7 +20,8 @@ Mail (SQLite) reads message metadata from Apple Mail's own database. Mail keeps 
 
 - **macOS only.** The plugin is written against Cocoa and `libsqlite3`. The bundle carries a `Windows64` binary from the original release, but the source has no Windows implementation, so don't rely on it.
 - **4D needs Full Disk Access.** `~/Library/Mail` is protected by macOS privacy controls (macOS 10.14 and later). Unless the application running the plugin (4D, 4D Server, or your merged application) is listed under **System Settings > Privacy & Security > Full Disk Access**, the database can't be opened and the command returns `{}`. macOS doesn't prompt for this permission; you have to add the application yourself.
-- **The database path is chosen from the macOS version, and the table stops at macOS 10.13.** Mail keeps its data in a versioned folder (`V2`, `V3`, …). The plugin maps the Darwin kernel version to a folder: 11 to 14 (OS X 10.7 to 10.10) → `V2`, 15 (10.11) → `V3`, 16 (10.12) → `V4`, 17 (10.13) → `V5`, anything newer → `V6`, anything older → `~/Library/Mail/Envelope Index`. Mail on macOS 10.15 and later uses a folder numbered higher than `V6`, so on every macOS this build supports (11.5 and later) the command looks for `~/Library/Mail/V6/MailData/Envelope Index`. If that file doesn't exist you get `{}`. If it does exist, it is a copy left over from an older macOS and the data is stale. See [Error handling & troubleshooting](#error-handling--troubleshooting).
+- **The plugin reads the newest Mail database it finds.** Mail keeps its data in a versioned folder whose number changes with macOS releases (`V8` on Big Sur, `V9` on Monterey, `V10` on Ventura and later, according to community reverse-engineering; Apple doesn't document it). An upgraded Mac can still hold the folders of earlier versions. The plugin looks in `~/Library/Mail/` for the highest-numbered `V<n>` folder that contains `MailData/Envelope Index` and opens that one. If there is none, it falls back to `~/Library/Mail/Envelope Index` (Mail before OS X 10.7). Release 1.0 instead mapped the Darwin version to a fixed folder and stopped at `V6`, so on macOS 10.15 and later it read a missing or stale file. This is the behaviour of the current source (2026 fix). See [Error handling & troubleshooting](#error-handling--troubleshooting).
+- **The plugin adapts to Mail's schema.** Mail's database layout is private and has changed between versions. Before querying, the plugin checks which tables and columns exist: it reads the snippet from `messages.snippet` (V6 and earlier) or from the `summaries` table (later versions), accepts both the old (`message_id`, `address_id`) and new (`message`, `address`) column names in `recipients` and `attachments`, and leaves out any number property whose column is missing (for example `date_created` on recent versions). Tested against mock databases built with both layouts, not against a real Mail database on current macOS (2026 fix).
 - **Failure is silent, not a 4D error.** No permission, a missing database, or a schema the queries don't match all give you a result with fewer keys, down to `{}`. The command never raises a 4D error, so check the keys before you use them.
 - **The command reads, it never writes.** The database is opened without permission to create the file and with SQLite's `query_only` mode on, so the plugin can't create an empty `Envelope Index` or change Mail's data. This is the behaviour of the current source (2026 review fixes); release 1.0 opened the file read-write and could create an empty database at a wrong path.
 - **It runs in the calling process and blocks it until the queries finish.** If Mail holds a lock on the database, the command waits up to 1 second for it (current source; release 1.0 didn't wait and could return a partial result). The manifest doesn't declare the command thread-safe, so expect 4D to refuse it in preemptive processes.
@@ -48,7 +49,7 @@ The IDs are the row numbers Mail uses in its database. The original README descr
 
 What you get back:
 
-- **IDs that are not in the database are skipped.** So is a message whose sender, subject or mailbox row is missing, because the query joins those tables. The `messages` collection can be shorter than your array, and nothing tells you which IDs were not found; compare the `ID` properties.
+- **IDs that are not in the database are skipped.** A message whose sender, subject or mailbox row is missing is still returned, with empty text for the missing parts (since the 2026 fix; release 1.0 skipped it). The `messages` collection can be shorter than your array, and nothing tells you which IDs were not found; compare the `ID` properties.
 - **The order of `messages` doesn't necessarily follow your array.** The query has no `ORDER BY`, so SQLite returns rows in whatever order its query plan produces (inferred from the SQL, not tested on a real Mail database).
 - **An empty array, or an array that is not `ARRAY LONGINT`,** gives `"messages":[]`. Only a Longint array is read; any other array type is treated as empty.
 - **Text columns that are NULL** become `""`.
@@ -68,7 +69,7 @@ Property | Type | Description
 ------------|------------|----
 `ID` | `Number` | The message ID, as passed in `messages`
 `subject` | `Text` | Subject line
-`snippet` | `Text` | Short preview of the message body, as Mail stores it
+`snippet` | `Text` | Short preview of the message body, as Mail stores it. On recent versions this comes from the `summaries` table, which Mail fills for only some messages, so it is often `""`. Missing if the database has neither source.
 `mailbox` | `Text` | URL-style identifier of the mailbox that holds the message
 `sender` | `Object` | `ID` (`Number`), `address` (`Text`), `name` (`Text`, display name)
 `recipients` | `Collection` | One object per recipient: `ID` (`Number`), `address` (`Text`), `name` (`Text`, display name)
@@ -81,6 +82,8 @@ Property | Type | Description
 `date_sent` | `Number` | Date sent, raw value (see above)
 `date_received` | `Number` | Date received, raw value
 `date_created` | `Number` | Date the entry was created, raw value
+
+The number properties from `size` to `date_created` are returned only when the database has that column; recent Mail versions have no `date_created`, for example. A column that exists but holds no value is returned as `0`.
 
 The recipient objects don't say whether a recipient is To, Cc or Bcc: the plugin reads that column but doesn't return it.
 
@@ -125,10 +128,9 @@ End if
 
 ## Error handling & troubleshooting
 
-- **The result is `{}`.** The database file could not be opened. Either 4D doesn't have Full Disk Access, or the file the plugin looks for doesn't exist. On macOS 10.15 and later the plugin looks in `~/Library/Mail/V6/MailData/`, which current versions of Mail don't use, and there is no setting to point it elsewhere.
-- **The result has `UUID` but no `messages`.** The database opened, but the message query failed, most likely because Mail's schema has changed since the plugin was written (for Mail on macOS 10.13).
-- **The data looks old.** On a Mac upgraded from macOS 10.14, `~/Library/Mail/V6/` can still hold the database from that time. The plugin reads it without knowing it is stale.
-- **Some IDs are missing from `messages`.** They are not in the database, or their sender, subject or mailbox row is missing. Compare the returned `ID` values with your array.
+- **The result is `{}`.** The database file could not be opened. Most often 4D doesn't have Full Disk Access: without it the plugin can't even list `~/Library/Mail/`, so it finds no `V<n>` folder. Otherwise Mail has never been set up for this user account.
+- **The result has `UUID` but no `messages`.** The database opened, but the message query failed. The plugin adapts to the schema differences it knows about, so this means Mail's schema has changed in a new way.
+- **Some IDs are missing from `messages`.** They are not in the database. Mail's IDs belong to one database: after an upgrade to a new `V<n>` folder, or after Mail rebuilds its index, old IDs no longer match. Compare the returned `ID` values with your array.
 - **`attachments` or `recipients` is missing from a message.** That sub-query failed to prepare (schema difference); the rest of the message is still returned.
 - **The command is refused in a preemptive process.** It isn't declared thread-safe; call it from a cooperative process.
 
