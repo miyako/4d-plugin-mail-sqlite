@@ -14,6 +14,60 @@ Mail (SQLite) reads message metadata from Apple Mail's own database. Mail keeps 
 
 [All releases](https://github.com/miyako/4d-plugin-mail-sqlite/releases). New releases are tagged `vX.Y.Z`; the original release is [1.0](https://github.com/miyako/4d-plugin-mail-sqlite/releases/tag/1.0).
 
+**Bump version** is manual: explicitly select the source branch and choose
+`patch`, `minor` or `major`. It checks out the immutable dispatch SHA, validates
+clean source metadata, and commits only the source version fields. Initial,
+final and executable pre-push checks require that branch to still advertise
+the exact selected SHA. The push must be exactly one nonforce update from a
+single-parent child commit, with tag following disabled. A moved, rewound,
+deleted or already-updated branch fails closed; dispatch again after inspecting
+the branch. Bump creates no tag, release or automatic Build.
+
+**Build** (`release.yml`) is a separate manual dispatch with **zero inputs**.
+Select the branch/commit to build; every checkout uses its immutable
+`github.sha`. Source metadata must contain one strict `X.Y.Z`. Both version keys
+in the three Xcode configurations are coordinated with source `Info.plist` and
+`English.lproj/InfoPlist.strings`. The original workflow header and modernization
+commit `78361da` promised this coordination; bump `3303693` updated only
+marketing. The migration repairs the stale current/localized values to the
+existing `1.0.1`, without incrementing the version. Existing supported Xcode
+references and absent `CFBundleVersion` are preserved. Prebuilt bundles, 4D
+databases, manifest/schema versions, localization counters and dependencies
+are not source-version authority and are never bumped.
+
+Publication is serialized across all branches, without cancelling running
+Builds. Early and final checks require successful exact remote-tag queries and
+authenticated pagination of **all releases, including drafts**; API errors
+(including 404), malformed responses and existing tags/releases stop publication.
+Only after the universal binary/resource, codesign verification, zip/dmg
+notarization and DMG stapling gates succeed does Build repeat availability
+checks, create a new lightweight `vX.Y.Z` tag at the selected SHA, verify it
+remotely, POST a new published non-prerelease with empty notes (the original
+policy), then upload `Mail (SQLite)-X.Y.Z.zip` and `.dmg` separately to its new
+release ID. There is no update, overwrite, rollback or retry.
+
+**Partial publication recovery:** any newly created tag, release and earlier
+uploaded assets remain if a later operation fails. Inspect the Actions error
+and remote state before deciding on manual recovery. Do not rerun Build for the
+same version expecting it to repair an existing tag/release: it deliberately
+refuses. Resolve the partial publication manually, or bump a new source version
+on the intended branch and dispatch Build separately.
+
+Native release prerequisites remain unchanged: macOS 11.5 deployment target,
+universal arm64/x86_64 output, Cocoa/AppKit/CoreGraphics and SDK `libsqlite3.tbd`,
+resource checks and Developer ID/notary credentials. The historical Windows64
+binary, QuickLook and other committed bundle resources ship as-is; no Windows
+job or native-gate bypass is introduced. Required secret **names** are
+`APPLE_DEVELOPER_ID_CERTIFICATE`, `APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD`,
+`KEYCHAIN_PASSWORD`, `NOTARYTOOL_APPLE_ID`, `NOTARYTOOL_TEAM_ID` and
+`NOTARYTOOL_PASSWORD`. Local lifecycle regressions do not execute native builds,
+signing, notarization or publication:
+
+```sh
+python3 -B -m unittest discover -s .github/tests -v
+actionlint
+```
+
 ---
 
 ## Requirements & platform notes
