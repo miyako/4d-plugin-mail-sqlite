@@ -70,6 +70,33 @@ actionlint
 
 ---
 
+## Native ownership regression
+
+The compiled picture helper (currently unused by the single Mail dispatcher
+command) now clears its path argument exactly once, retains the output before
+clearing its original owner, releases the `setBytes` temporary, and avoids
+overwriting allocated empty owners. Picture-copy conversion uses the bundled
+converter's **byte** count divided by `sizeof(PA_Unichar)`, not bytes as UTF-16
+code units. Borrowed picture inputs remain detached before argument cleanup;
+returned pictures still belong to their callers.
+
+Run the unsigned synthetic regression with:
+
+```sh
+python3 -B .github/tests/test_ownership.py -v
+```
+
+It compiles all native wrappers and the complete unmodified bundled SDK with
+ASan/UBSan. Before compilation it replaces the two Mail/library discovery
+functions in a temporary copy of `4DPlugin.cpp`; the dispatcher can reach only
+an explicitly created synthetic SQLite fixture. The engine shim does not
+invoke 4D commands, Mail, AppleScript, AppleEvents or platform discovery.
+The scoped `Native ownership` CI does not build the plugin bundle, sign,
+package or publish anything. See [the audit evidence](.github/tests/ownership-audit.md)
+for exact contracts, inventory, provenance and limits.
+
+---
+
 ## Requirements & platform notes
 
 - **macOS only.** The plugin is written against Cocoa and `libsqlite3`. The bundle carries a `Windows64` binary from the original release, but the source has no Windows implementation, so don't rely on it.
